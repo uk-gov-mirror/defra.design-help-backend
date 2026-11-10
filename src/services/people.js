@@ -61,12 +61,26 @@ export function toApiPerson(doc) {
   if (!doc) {
     return null
   }
-  const { _id, managerId, helping, gdad, ...rest } = doc
+  const {
+    _id,
+    managerId,
+    helping,
+    gdad,
+    gdadScoresNotifiedAt,
+    gdadScoresNotifiedById,
+    ...rest
+  } = doc
   return {
     id: _id.toString(),
     managerId: managerId ? managerId.toString() : null,
     helping: (helping ?? []).map((id) => id.toString()),
     gdad: apiGdad(gdad),
+    gdadScoresNotifiedAt: gdadScoresNotifiedAt
+      ? new Date(gdadScoresNotifiedAt).toISOString()
+      : null,
+    gdadScoresNotifiedById: gdadScoresNotifiedById
+      ? gdadScoresNotifiedById.toString()
+      : null,
     ...rest
   }
 }
@@ -155,6 +169,8 @@ export async function createPerson(db, payload) {
     managerId: null,
     helping: [],
     gdad: {},
+    gdadScoresNotifiedAt: null,
+    gdadScoresNotifiedById: null,
     activatedAt: null,
     createdAt: now,
     updatedAt: now
@@ -440,6 +456,24 @@ export async function upsertGdadScores(
     }
   }
   await people(db).updateOne({ _id: new ObjectId(person.id) }, { $set })
+  return getPerson(db, person.id)
+}
+
+/**
+ * Records that the Head of Design has emailed this person to say their GDaD
+ * scores were updated. Person-level: one timestamp covers all skills.
+ */
+export async function markGdadScoresNotified(db, idOrSlug, notifiedById) {
+  const person = await requirePerson(db, idOrSlug)
+  await people(db).updateOne(
+    { _id: new ObjectId(person.id) },
+    {
+      $set: {
+        gdadScoresNotifiedAt: new Date(),
+        gdadScoresNotifiedById: toId(notifiedById)
+      }
+    }
+  )
   return getPerson(db, person.id)
 }
 

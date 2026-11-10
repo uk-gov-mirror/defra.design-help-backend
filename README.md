@@ -6,20 +6,21 @@ It stores everything in a single `people` collection: identity/allow-list (email
 
 ## API summary
 
-| Route                                                             | Purpose                                                                                  |
-| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `GET /people?filter=&sort=`                                       | List people (case-insensitive filter over name/role/tags/free text; sort `a-z`/`z-a`)    |
-| `POST /people`                                                    | Create a person — a bare `{email}` is an allow-list entry; profile fields optional       |
-| `GET /people/{idOrSlug}` · `GET /people/by-email/{email}`         | Fetch one person                                                                         |
-| `PATCH /people/{id}`                                              | Update profile fields / email / approval                                                 |
-| `DELETE /people/{id}?mode=full\|profile\|access`                  | Delete entirely (with reference cleanup), clear the profile only, or revoke sign-in only |
-| `POST /people/{id}/activate`                                      | Record first sign-in                                                                     |
-| `POST /people/{id}/admin`                                         | Grant/revoke the dynamic admin flag                                                      |
-| `PUT /people/{id}/helping`                                        | Replace availability + long-term helpee list                                             |
-| `PUT /people/{id}/manager`                                        | Allocate a line manager (must hold the line-manager flag)                                |
-| `PUT /line-managers`                                              | Replace the whole line-manager set (prunes stale allocations)                            |
-| `GET /helping-pairs`                                              | All helper→helpee pairs                                                                  |
-| `PUT /people/{id}/gdad/evidence` · `PUT /people/{id}/gdad/scores` | Upsert GDaD evidence / official scores per skill                                         |
+| Route                                                             | Purpose                                                                                                                                   |
+| ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /people?filter=&sort=`                                       | List people (case-insensitive filter over name/role/tags/free text; sort `a-z`/`z-a`)                                                     |
+| `POST /people`                                                    | Create a person — a bare `{email}` is an allow-list entry; profile fields optional                                                        |
+| `GET /people/{idOrSlug}` · `GET /people/by-email/{email}`         | Fetch one person                                                                                                                          |
+| `PATCH /people/{id}`                                              | Update profile fields / email / approval                                                                                                  |
+| `DELETE /people/{id}?mode=full\|profile\|access`                  | Delete entirely (with reference cleanup), clear the profile only, or revoke sign-in only                                                  |
+| `POST /people/{id}/activate`                                      | Record first sign-in                                                                                                                      |
+| `POST /people/{id}/admin`                                         | Grant/revoke the dynamic admin flag                                                                                                       |
+| `PUT /people/{id}/helping`                                        | Replace availability + long-term helpee list                                                                                              |
+| `PUT /people/{id}/manager`                                        | Allocate a line manager (must hold the line-manager flag)                                                                                 |
+| `PUT /line-managers`                                              | Replace the whole line-manager set (prunes stale allocations)                                                                             |
+| `GET /helping-pairs`                                              | All helper→helpee pairs                                                                                                                   |
+| `PUT /people/{id}/gdad/evidence` · `PUT /people/{id}/gdad/scores` | Upsert GDaD evidence / official scores per skill                                                                                          |
+| `PUT /people/{id}/gdad/scores-notified`                           | Record that the person was emailed about updated GDaD scores (`{ notifiedById }`); sets `gdadScoresNotifiedAt` / `gdadScoresNotifiedById` |
 
 Config: `APPROVED_EMAILS` (comma-separated) is seeded idempotently at startup under a mongo-lock, so a fresh environment is usable immediately.
 

@@ -18,6 +18,7 @@ import {
   getPersonByEmail,
   listHelpingPairs,
   listPeople,
+  markGdadScoresNotified,
   replaceLineManagers,
   setAdmin,
   setHelping,
@@ -271,6 +272,25 @@ export const peopleRoutes = [
           request.params.id,
           request.payload.scores,
           request.payload.scoredById
+        )
+      )
+  },
+  {
+    method: 'PUT',
+    path: '/people/{id}/gdad/scores-notified',
+    options: {
+      validate: {
+        payload: Joi.object({
+          notifiedById: objectIdSchema.required()
+        })
+      }
+    },
+    handler: (request, h) =>
+      respond(h, () =>
+        markGdadScoresNotified(
+          request.db,
+          request.params.id,
+          request.payload.notifiedById
         )
       )
   },

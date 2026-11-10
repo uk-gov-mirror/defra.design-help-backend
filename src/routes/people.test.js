@@ -430,4 +430,90 @@ describe('people API', () => {
       expect(statusCode).toBe(400)
     })
   })
+
+  describe('GDaD scores notified', () => {
+    test('new and old people report no notification yet', async () => {
+      const fresh = await createPerson({ name: 'Fresh Person' })
+      expect(fresh.gdadScoresNotifiedAt).toBeNull()
+      expect(fresh.gdadScoresNotifiedById).toBeNull()
+
+      // A document saved before these fields existed
+      const { insertedId } = await server.db
+        .collection('people')
+        .insertOne({ name: 'Old Person', slug: 'old-person', gdad: {} })
+      const old = await server.inject({ url: `/people/${insertedId}` })
+      expect(old.statusCode).toBe(200)
+      expect(old.result.gdadScoresNotifiedAt).toBeNull()
+      expect(old.result.gdadScoresNotifiedById).toBeNull()
+    })
+
+    test('records when and by whom, and returns it everywhere', async () => {
+      const person = await createPerson({ name: 'Designer Five' })
+      const head = await createPerson({ name: 'Head Of Design' })
+      const before = Date.now()
+
+      const { statusCode, result } = await server.inject({
+        method: 'PUT',
+        url: `/people/${person.id}/gdad/scores-notified`,
+        payload: { notifiedById: head.id }
+      })
+      expect(statusCode).toBe(200)
+      expect(result.id).toBe(person.id)
+      expect(result.gdadScoresNotifiedById).toBe(head.id)
+      expect(typeof result.gdadScoresNotifiedAt).toBe('string')
+      const notifiedAt = Date.parse(result.gdadScoresNotifiedAt)
+      expect(new Date(notifiedAt).toISOString()).toBe(
+        result.gdadScoresNotifiedAt
+      )
+      expect(notifiedAt).toBeGreaterThanOrEqual(before - 1000)
+      expect(notifiedAt).toBeLessThanOrEqual(Date.now() + 1000)
+
+      const fetched = await server.inject({ url: `/people/${person.id}` })
+      expect(fetched.result.gdadScoresNotifiedAt).toBe(
+        result.gdadScoresNotifiedAt
+      )
+      expect(fetched.result.gdadScoresNotifiedById).toBe(head.id)
+
+      const list = await server.inject({ url: '/people' })
+      const listed = list.result.find((p) => p.id === person.id)
+      expect(listed.gdadScoresNotifiedAt).toBe(result.gdadScoresNotifiedAt)
+      expect(listed.gdadScoresNotifiedById).toBe(head.id)
+      const other = list.result.find((p) => p.id === head.id)
+      expect(other.gdadScoresNotifiedAt).toBeNull()
+      expect(other.gdadScoresNotifiedById).toBeNull()
+
+      // Stored as real Date / ObjectId values
+      const raw = await server.db
+        .collection('people')
+        .findOne({ slug: 'designer-five' })
+      expect(raw.gdadScoresNotifiedAt).toBeInstanceOf(Date)
+      expect(raw.gdadScoresNotifiedById.toString()).toBe(head.id)
+    })
+
+    test('returns 404 for an unknown person', async () => {
+      const head = await createPerson({ name: 'Head Two' })
+      const { statusCode } = await server.inject({
+        method: 'PUT',
+        url: '/people/0123456789abcdef01234567/gdad/scores-notified',
+        payload: { notifiedById: head.id }
+      })
+      expect(statusCode).toBe(404)
+    })
+
+    test('returns 400 for a missing or invalid notifier id', async () => {
+      const person = await createPerson({ name: 'Designer Six' })
+      for (const payload of [
+        {},
+        { notifiedById: 'not-an-id' },
+        { notifiedById: null }
+      ]) {
+        const { statusCode } = await server.inject({
+          method: 'PUT',
+          url: `/people/${person.id}/gdad/scores-notified`,
+          payload
+        })
+        expect(statusCode).toBe(400)
+      }
+    })
+  })
 })
