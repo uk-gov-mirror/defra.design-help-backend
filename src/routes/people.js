@@ -25,6 +25,7 @@ import {
   setManager,
   updatePerson,
   upsertGdadEvidence,
+  upsertGdadNewEvidence,
   upsertGdadScores
 } from '#/services/people.js'
 
@@ -48,6 +49,19 @@ const profileFieldsSchema = {
   contactEmail: Joi.string().trim().email().max(255).allow(null, '')
 }
 
+function withCode(boom, code) {
+  boom.output.payload.code = code
+  return boom
+}
+
+const gdadEvidencePayloadSchema = Joi.object()
+  .pattern(
+    Joi.string().valid(...GDAD_SKILL_KEYS),
+    Joi.string().allow(null, '').max(MAX_EVIDENCE_LENGTH)
+  )
+  .min(1)
+  .required()
+
 function mapPeopleError(error) {
   if (!(error instanceof PeopleError)) {
     throw error
@@ -64,6 +78,18 @@ function mapPeopleError(error) {
     case 'evidence_too_long':
       return Boom.badRequest(
         `Evidence for ${error.detail} is over ${MAX_EVIDENCE_LENGTH} characters`
+      )
+    case 'no_current_evidence':
+      return withCode(
+        Boom.conflict(
+          `New evidence needs current evidence first: ${[error.detail].flat().join(', ')}`
+        ),
+        'no_current_evidence'
+      )
+    case 'concurrent_update':
+      return withCode(
+        Boom.conflict('The evidence changed while saving; try again'),
+        'concurrent_update'
       )
     default:
       return Boom.badImplementation(error.message)
@@ -227,13 +253,8 @@ export const peopleRoutes = [
     options: {
       validate: {
         payload: Joi.object({
-          evidence: Joi.object()
-            .pattern(
-              Joi.string().valid(...GDAD_SKILL_KEYS),
-              Joi.string().allow(null, '').max(MAX_EVIDENCE_LENGTH)
-            )
-            .min(1)
-            .required()
+          evidence: gdadEvidencePayloadSchema,
+          updatedById: objectIdSchema.allow(null)
         })
       }
     },
@@ -242,7 +263,29 @@ export const peopleRoutes = [
         upsertGdadEvidence(
           request.db,
           request.params.id,
-          request.payload.evidence
+          request.payload.evidence,
+          request.payload.updatedById
+        )
+      )
+  },
+  {
+    method: 'PUT',
+    path: '/people/{id}/gdad/new-evidence',
+    options: {
+      validate: {
+        payload: Joi.object({
+          evidence: gdadEvidencePayloadSchema,
+          updatedById: objectIdSchema.allow(null)
+        })
+      }
+    },
+    handler: (request, h) =>
+      respond(h, () =>
+        upsertGdadNewEvidence(
+          request.db,
+          request.params.id,
+          request.payload.evidence,
+          request.payload.updatedById
         )
       )
   },

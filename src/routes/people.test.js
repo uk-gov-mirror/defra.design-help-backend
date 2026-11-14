@@ -1,3 +1,5 @@
+import { ObjectId } from 'mongodb'
+
 describe('people API', () => {
   let server
 
@@ -428,6 +430,301 @@ describe('people API', () => {
         payload: { scores: { leading_design: 5 }, scoredById: scorer.id }
       })
       expect(statusCode).toBe(400)
+    })
+  })
+
+  describe('GDaD new evidence and previous evidence', () => {
+    const NEW_FIELDS_EMPTY = {
+      newEvidenceText: null,
+      newEvidenceUpdatedAt: null,
+      newEvidenceUpdatedById: null
+    }
+
+    function put(url, payload) {
+      return server.inject({ method: 'PUT', url, payload })
+    }
+
+    async function saveEvidence(person, evidence, updatedById) {
+      const response = await put(`/people/${person.id}/gdad/evidence`, {
+        evidence,
+        ...(updatedById ? { updatedById } : {})
+      })
+      expect(response.statusCode).toBe(200)
+      return response.result
+    }
+
+    async function saveNewEvidence(person, evidence, updatedById) {
+      return put(`/people/${person.id}/gdad/new-evidence`, {
+        evidence,
+        ...(updatedById ? { updatedById } : {})
+      })
+    }
+
+    async function score(person, scores, scoredById) {
+      const response = await put(`/people/${person.id}/gdad/scores`, {
+        scores,
+        scoredById
+      })
+      expect(response.statusCode).toBe(200)
+      return response.result
+    }
+
+    test('old records come back with the new fields defaulted', async () => {
+      const scorerId = new ObjectId()
+      await server.db.collection('people').insertOne({
+        name: 'Legacy Person',
+        slug: 'legacy-person',
+        gdad: {
+          iterative_design: {
+            evidenceText: 'Old evidence',
+            evidenceUpdatedAt: new Date('2025-01-02T03:04:05Z'),
+            officialScore: 2,
+            scoredAt: new Date('2025-09-10T00:00:00Z'),
+            scoredById: scorerId
+          }
+        }
+      })
+
+      const { result } = await server.inject({ url: '/people/legacy-person' })
+      expect(result.gdad.iterative_design).toEqual({
+        evidenceText: 'Old evidence',
+        evidenceUpdatedAt: '2025-01-02T03:04:05.000Z',
+        evidenceUpdatedById: null,
+        officialScore: 2,
+        scoredAt: '2025-09-10T00:00:00.000Z',
+        scoredById: scorerId.toString(),
+        ...NEW_FIELDS_EMPTY,
+        previous: []
+      })
+    })
+
+    test('evidence records who updated it, and still works without', async () => {
+      const person = await createPerson({ name: 'Evidence Updater' })
+      const editor = await createPerson({ name: 'The Editor' })
+
+      const withId = await saveEvidence(
+        person,
+        { iterative_design: 'Some evidence' },
+        editor.id
+      )
+      expect(withId.gdad.iterative_design.evidenceUpdatedById).toBe(editor.id)
+      expect(typeof withId.gdad.iterative_design.evidenceUpdatedAt).toBe(
+        'string'
+      )
+
+      const withoutId = await saveEvidence(person, {
+        iterative_design: 'Edited evidence'
+      })
+      expect(withoutId.gdad.iterative_design.evidenceText).toBe(
+        'Edited evidence'
+      )
+      expect(withoutId.gdad.iterative_design.evidenceUpdatedById).toBeNull()
+      expect(withoutId.gdad.iterative_design).toMatchObject(NEW_FIELDS_EMPTY)
+      expect(withoutId.gdad.iterative_design.previous).toEqual([])
+
+      const badId = await put(`/people/${person.id}/gdad/evidence`, {
+        evidence: { iterative_design: 'x' },
+        updatedById: 'not-an-id'
+      })
+      expect(badId.statusCode).toBe(400)
+    })
+
+    test('sets, trims and clears new evidence', async () => {
+      const person = await createPerson({ name: 'New Evidence Person' })
+      const editor = await createPerson({ name: 'New Editor' })
+      await saveEvidence(person, { leading_design: 'Current evidence' })
+
+      const saved = await saveNewEvidence(
+        person,
+        { leading_design: '  Working on it  ' },
+        editor.id
+      )
+      expect(saved.statusCode).toBe(200)
+      const entry = saved.result.gdad.leading_design
+      expect(entry.newEvidenceText).toBe('Working on it')
+      expect(typeof entry.newEvidenceUpdatedAt).toBe('string')
+      expect(entry.newEvidenceUpdatedById).toBe(editor.id)
+      expect(entry.evidenceText).toBe('Current evidence')
+
+      const cleared = await saveNewEvidence(person, { leading_design: '' })
+      expect(cleared.statusCode).toBe(200)
+      expect(cleared.result.gdad.leading_design).toMatchObject({
+        ...NEW_FIELDS_EMPTY,
+        evidenceText: 'Current evidence'
+      })
+    })
+
+    test('refuses new evidence when there is no current evidence', async () => {
+      const person = await createPerson({ name: 'No Current Evidence' })
+      const response = await saveNewEvidence(person, {
+        designing_together: 'Too early'
+      })
+      expect(response.statusCode).toBe(409)
+      expect(response.result.code).toBe('no_current_evidence')
+
+      const { result } = await server.inject({ url: `/people/${person.id}` })
+      expect(result.gdad.designing_together).toBeUndefined()
+    })
+
+    test('rejects new evidence that is too long, an unknown skill or person', async () => {
+      const person = await createPerson({ name: 'Validation Person' })
+      await saveEvidence(person, { leading_design: 'Current' })
+
+      const tooLong = await saveNewEvidence(person, {
+        leading_design: 'x'.repeat(12001)
+      })
+      expect(tooLong.statusCode).toBe(400)
+
+      const badSkill = await saveNewEvidence(person, { juggling: 'x' })
+      expect(badSkill.statusCode).toBe(400)
+
+      const empty = await put(`/people/${person.id}/gdad/new-evidence`, {
+        evidence: {}
+      })
+      expect(empty.statusCode).toBe(400)
+
+      const unknown = await put(
+        '/people/0123456789abcdef01234567/gdad/new-evidence',
+        { evidence: { leading_design: 'x' } }
+      )
+      expect(unknown.statusCode).toBe(404)
+    })
+
+    test('scoring new evidence promotes it and archives the old evidence', async () => {
+      const person = await createPerson({ name: 'Promoted Person' })
+      const scorer = await createPerson({ name: 'Head Scorer' })
+      const editor = await createPerson({ name: 'Promo Editor' })
+
+      await saveEvidence(person, { iterative_design: 'Year one' }, editor.id)
+      const firstScore = await score(person, { iterative_design: 1 }, scorer.id)
+      const before = firstScore.gdad.iterative_design
+
+      const withNew = await saveNewEvidence(
+        person,
+        { iterative_design: 'Year two' },
+        editor.id
+      )
+      const newUpdatedAt =
+        withNew.result.gdad.iterative_design.newEvidenceUpdatedAt
+
+      const promoted = await score(person, { iterative_design: 3 }, scorer.id)
+      const entry = promoted.gdad.iterative_design
+      expect(entry.evidenceText).toBe('Year two')
+      expect(entry.evidenceUpdatedAt).toBe(newUpdatedAt)
+      expect(entry.evidenceUpdatedById).toBe(editor.id)
+      expect(entry.officialScore).toBe(3)
+      expect(entry.scoredById).toBe(scorer.id)
+      expect(entry).toMatchObject(NEW_FIELDS_EMPTY)
+
+      expect(entry.previous).toHaveLength(1)
+      expect(entry.previous[0]).toEqual({
+        evidenceText: 'Year one',
+        evidenceUpdatedAt: before.evidenceUpdatedAt,
+        officialScore: 1,
+        scoredAt: before.scoredAt,
+        scoredById: scorer.id,
+        archivedAt: expect.any(String)
+      })
+      expect(Date.parse(entry.previous[0].archivedAt)).toBeGreaterThanOrEqual(
+        Date.parse(before.scoredAt)
+      )
+
+      // Stored as real dates and ids, not strings
+      const raw = await server.db
+        .collection('people')
+        .findOne({ _id: new ObjectId(person.id) })
+      const archived = raw.gdad.iterative_design.previous[0]
+      expect(archived.archivedAt).toBeInstanceOf(Date)
+      expect(archived.scoredAt).toBeInstanceOf(Date)
+      expect(archived.scoredById).toBeInstanceOf(ObjectId)
+    })
+
+    test('a null score never promotes', async () => {
+      const person = await createPerson({ name: 'Null Score Person' })
+      const scorer = await createPerson({ name: 'Null Scorer' })
+      await saveEvidence(person, { leading_design: 'Current' })
+      await score(person, { leading_design: 2 }, scorer.id)
+      await saveNewEvidence(person, { leading_design: 'Next' })
+
+      const cleared = await score(person, { leading_design: null }, scorer.id)
+      const entry = cleared.gdad.leading_design
+      expect(entry.officialScore).toBeNull()
+      expect(entry.evidenceText).toBe('Current')
+      expect(entry.newEvidenceText).toBe('Next')
+      expect(entry.previous).toEqual([])
+    })
+
+    test('skills without new evidence are scored exactly as before', async () => {
+      const person = await createPerson({ name: 'Mixed Skills Person' })
+      const scorer = await createPerson({ name: 'Mixed Scorer' })
+      await saveEvidence(person, {
+        leading_design: 'Leading current',
+        iterative_design: 'Iterative current'
+      })
+      await score(person, { leading_design: 1, iterative_design: 1 }, scorer.id)
+      await saveNewEvidence(person, { leading_design: 'Leading next' })
+
+      const result = await score(
+        person,
+        { leading_design: 2, iterative_design: 2 },
+        scorer.id
+      )
+      expect(result.gdad.leading_design.evidenceText).toBe('Leading next')
+      expect(result.gdad.leading_design.previous).toHaveLength(1)
+
+      const iterative = result.gdad.iterative_design
+      expect(iterative.evidenceText).toBe('Iterative current')
+      expect(iterative.officialScore).toBe(2)
+      expect(iterative.previous).toEqual([])
+      expect(iterative).toMatchObject(NEW_FIELDS_EMPTY)
+    })
+
+    test('previous evidence is newest first and capped at 20', async () => {
+      const person = await createPerson({ name: 'Many Years Person' })
+      const scorer = await createPerson({ name: 'Many Scorer' })
+      await saveEvidence(person, { evidence_based_design: 'Year 0' })
+      await score(person, { evidence_based_design: 1 }, scorer.id)
+
+      for (let year = 1; year <= 22; year++) {
+        const response = await saveNewEvidence(person, {
+          evidence_based_design: `Year ${year}`
+        })
+        expect(response.statusCode).toBe(200)
+        await score(
+          person,
+          { evidence_based_design: (year % 3) + 1 },
+          scorer.id
+        )
+      }
+
+      const { result } = await server.inject({ url: `/people/${person.id}` })
+      const entry = result.gdad.evidence_based_design
+      expect(entry.evidenceText).toBe('Year 22')
+      expect(entry.previous).toHaveLength(20)
+      expect(entry.previous[0].evidenceText).toBe('Year 21')
+      expect(entry.previous[19].evidenceText).toBe('Year 2')
+      const archivedTimes = entry.previous.map((p) => Date.parse(p.archivedAt))
+      expect([...archivedTimes].sort((a, b) => b - a)).toEqual(archivedTimes)
+    })
+
+    test('scores reject an unknown skill or person', async () => {
+      const scorer = await createPerson({ name: 'Reject Scorer' })
+      const person = await createPerson({ name: 'Reject Person' })
+
+      const badSkill = await put(`/people/${person.id}/gdad/scores`, {
+        scores: { juggling: 2 },
+        scoredById: scorer.id
+      })
+      expect(badSkill.statusCode).toBe(400)
+
+      const unknown = await put(
+        '/people/0123456789abcdef01234567/gdad/scores',
+        {
+          scores: { leading_design: 2 },
+          scoredById: scorer.id
+        }
+      )
+      expect(unknown.statusCode).toBe(404)
     })
   })
 

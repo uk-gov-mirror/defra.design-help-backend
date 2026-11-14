@@ -85,13 +85,46 @@ export function toApiPerson(doc) {
   }
 }
 
+function isoOrNull(value) {
+  return value ? new Date(value).toISOString() : null
+}
+
+function idOrNull(value) {
+  return value ? value.toString() : null
+}
+
+function apiGdadPrevious(entry) {
+  return {
+    evidenceText: entry.evidenceText ?? null,
+    evidenceUpdatedAt: isoOrNull(entry.evidenceUpdatedAt),
+    officialScore: entry.officialScore ?? null,
+    scoredAt: isoOrNull(entry.scoredAt),
+    scoredById: idOrNull(entry.scoredById),
+    archivedAt: isoOrNull(entry.archivedAt)
+  }
+}
+
+/**
+ * Every skill entry always carries the full set of fields, so records saved
+ * before a field existed come back with the same shape as new ones. Dates are
+ * ISO strings and ids are strings (or null).
+ */
 function apiGdad(gdad) {
   const result = {}
   for (const key of Object.keys(gdad ?? {})) {
-    const { scoredById, ...entry } = gdad[key]
+    const entry = gdad[key] ?? {}
     result[key] = {
       ...entry,
-      scoredById: scoredById ? scoredById.toString() : null
+      evidenceText: entry.evidenceText ?? null,
+      evidenceUpdatedAt: isoOrNull(entry.evidenceUpdatedAt),
+      evidenceUpdatedById: idOrNull(entry.evidenceUpdatedById),
+      officialScore: entry.officialScore ?? null,
+      scoredAt: isoOrNull(entry.scoredAt),
+      scoredById: idOrNull(entry.scoredById),
+      newEvidenceText: entry.newEvidenceText ?? null,
+      newEvidenceUpdatedAt: isoOrNull(entry.newEvidenceUpdatedAt),
+      newEvidenceUpdatedById: idOrNull(entry.newEvidenceUpdatedById),
+      previous: (entry.previous ?? []).map(apiGdadPrevious)
     }
   }
   return result
@@ -412,25 +445,89 @@ export async function setManager(db, idOrSlug, managerIdValue) {
   return getPerson(db, person.id)
 }
 
-export async function upsertGdadEvidence(db, idOrSlug, evidenceBySkill) {
+function checkSkillKey(skillKey) {
+  if (!GDAD_SKILL_KEYS.includes(skillKey)) {
+    throw new PeopleError('invalid_skill', skillKey)
+  }
+}
+
+function cleanEvidence(skillKey, text) {
+  const value = String(text ?? '').trim()
+  if (value.length > MAX_EVIDENCE_LENGTH) {
+    throw new PeopleError('evidence_too_long', skillKey)
+  }
+  return value
+}
+
+export async function upsertGdadEvidence(
+  db,
+  idOrSlug,
+  evidenceBySkill,
+  updatedById
+) {
   const person = await requirePerson(db, idOrSlug)
+  const updaterId = toId(updatedById)
   const $set = {}
   const now = new Date()
   for (const [skillKey, text] of Object.entries(evidenceBySkill)) {
-    if (!GDAD_SKILL_KEYS.includes(skillKey)) {
-      throw new PeopleError('invalid_skill', skillKey)
-    }
-    const value = String(text ?? '').trim()
-    if (value.length > MAX_EVIDENCE_LENGTH) {
-      throw new PeopleError('evidence_too_long', skillKey)
-    }
+    checkSkillKey(skillKey)
+    const value = cleanEvidence(skillKey, text)
     $set[`gdad.${skillKey}.evidenceText`] = value || null
     $set[`gdad.${skillKey}.evidenceUpdatedAt`] = value ? now : null
+    $set[`gdad.${skillKey}.evidenceUpdatedById`] = value ? updaterId : null
   }
   await people(db).updateOne({ _id: new ObjectId(person.id) }, { $set })
   return getPerson(db, person.id)
 }
 
+/**
+ * New evidence is what a designer works on towards the next annual review.
+ * It sits alongside the current (scored) evidence until it is scored, and can
+ * only be started once there is current evidence. Empty text discards it.
+ */
+export async function upsertGdadNewEvidence(
+  db,
+  idOrSlug,
+  evidenceBySkill,
+  updatedById
+) {
+  const person = await requirePerson(db, idOrSlug)
+  const updaterId = toId(updatedById)
+  const filter = { _id: new ObjectId(person.id) }
+  const $set = {}
+  const now = new Date()
+  for (const [skillKey, text] of Object.entries(evidenceBySkill)) {
+    checkSkillKey(skillKey)
+    const value = cleanEvidence(skillKey, text)
+    if (value) {
+      if (!person.gdad[skillKey]?.evidenceText) {
+        throw new PeopleError('no_current_evidence', skillKey)
+      }
+      // Guard against the current evidence being cleared in the meantime
+      filter[`gdad.${skillKey}.evidenceText`] = { $type: 'string', $ne: '' }
+    }
+    $set[`gdad.${skillKey}.newEvidenceText`] = value || null
+    $set[`gdad.${skillKey}.newEvidenceUpdatedAt`] = value ? now : null
+    $set[`gdad.${skillKey}.newEvidenceUpdatedById`] = value ? updaterId : null
+  }
+  const { matchedCount } = await people(db).updateOne(filter, { $set })
+  if (matchedCount === 0) {
+    throw new PeopleError('no_current_evidence', Object.keys(evidenceBySkill))
+  }
+  return getPerson(db, person.id)
+}
+
+export const MAX_GDAD_PREVIOUS = 20
+const MAX_SCORE_ATTEMPTS = 3
+
+/**
+ * Scoring a skill that has new evidence first promotes it: the current
+ * evidence and its score move to the front of `previous`, and the new
+ * evidence becomes current. Clearing a score (null) never promotes.
+ *
+ * The update is a single updateOne per person. It only applies if the
+ * evidence it read is unchanged, and retries a few times if not.
+ */
 export async function upsertGdadScores(
   db,
   idOrSlug,
@@ -438,25 +535,74 @@ export async function upsertGdadScores(
   scoredById
 ) {
   const person = await requirePerson(db, idOrSlug)
+  const _id = new ObjectId(person.id)
   const scorerId = toId(scoredById)
-  const $set = {}
-  const now = new Date()
-  for (const [skillKey, score] of Object.entries(scoresBySkill)) {
-    if (!GDAD_SKILL_KEYS.includes(skillKey)) {
-      throw new PeopleError('invalid_skill', skillKey)
+  for (const skillKey of Object.keys(scoresBySkill)) {
+    checkSkillKey(skillKey)
+  }
+
+  for (let attempt = 0; attempt < MAX_SCORE_ATTEMPTS; attempt++) {
+    const doc = await people(db).findOne({ _id })
+    if (!doc) {
+      throw new PeopleError('not_found', idOrSlug)
     }
-    if (score === null) {
-      $set[`gdad.${skillKey}.officialScore`] = null
-      $set[`gdad.${skillKey}.scoredById`] = null
-      $set[`gdad.${skillKey}.scoredAt`] = null
-    } else {
-      $set[`gdad.${skillKey}.officialScore`] = score
-      $set[`gdad.${skillKey}.scoredById`] = scorerId
-      $set[`gdad.${skillKey}.scoredAt`] = now
+    const filter = { _id }
+    const $set = {}
+    const $push = {}
+    const now = new Date()
+
+    for (const [skillKey, score] of Object.entries(scoresBySkill)) {
+      const path = `gdad.${skillKey}`
+      if (score === null) {
+        $set[`${path}.officialScore`] = null
+        $set[`${path}.scoredById`] = null
+        $set[`${path}.scoredAt`] = null
+        continue
+      }
+
+      const entry = doc.gdad?.[skillKey] ?? {}
+      if (entry.newEvidenceText) {
+        filter[`${path}.newEvidenceText`] = entry.newEvidenceText
+        filter[`${path}.evidenceText`] = entry.evidenceText ?? null
+        if (entry.evidenceText || entry.officialScore != null) {
+          $push[`${path}.previous`] = {
+            $each: [
+              {
+                evidenceText: entry.evidenceText ?? null,
+                evidenceUpdatedAt: entry.evidenceUpdatedAt ?? null,
+                officialScore: entry.officialScore ?? null,
+                scoredAt: entry.scoredAt ?? null,
+                scoredById: entry.scoredById ?? null,
+                archivedAt: now
+              }
+            ],
+            $position: 0,
+            $slice: MAX_GDAD_PREVIOUS
+          }
+        }
+        $set[`${path}.evidenceText`] = entry.newEvidenceText
+        $set[`${path}.evidenceUpdatedAt`] = entry.newEvidenceUpdatedAt ?? now
+        $set[`${path}.evidenceUpdatedById`] =
+          entry.newEvidenceUpdatedById ?? null
+        $set[`${path}.newEvidenceText`] = null
+        $set[`${path}.newEvidenceUpdatedAt`] = null
+        $set[`${path}.newEvidenceUpdatedById`] = null
+      } else {
+        // Matches null or missing: new evidence must not appear unscored
+        filter[`${path}.newEvidenceText`] = null
+      }
+      $set[`${path}.officialScore`] = score
+      $set[`${path}.scoredById`] = scorerId
+      $set[`${path}.scoredAt`] = now
+    }
+
+    const update = Object.keys($push).length > 0 ? { $set, $push } : { $set }
+    const { matchedCount } = await people(db).updateOne(filter, update)
+    if (matchedCount === 1) {
+      return getPerson(db, person.id)
     }
   }
-  await people(db).updateOne({ _id: new ObjectId(person.id) }, { $set })
-  return getPerson(db, person.id)
+  throw new PeopleError('concurrent_update', person.id)
 }
 
 /**
