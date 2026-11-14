@@ -1,4 +1,4 @@
-import { ObjectId } from 'mongodb'
+import { Collection, ObjectId } from 'mongodb'
 
 describe('people API', () => {
   let server
@@ -620,6 +620,7 @@ describe('people API', () => {
       expect(entry.previous[0]).toEqual({
         evidenceText: 'Year one',
         evidenceUpdatedAt: before.evidenceUpdatedAt,
+        evidenceUpdatedById: editor.id,
         officialScore: 1,
         scoredAt: before.scoredAt,
         scoredById: scorer.id,
@@ -705,6 +706,144 @@ describe('people API', () => {
       expect(entry.previous[19].evidenceText).toBe('Year 2')
       const archivedTimes = entry.previous.map((p) => Date.parse(p.archivedAt))
       expect([...archivedTimes].sort((a, b) => b - a)).toEqual(archivedTimes)
+    })
+
+    test('old previous entries default evidenceUpdatedById to null', async () => {
+      await server.db.collection('people').insertOne({
+        name: 'Legacy History',
+        slug: 'legacy-history',
+        gdad: {
+          leading_design: {
+            evidenceText: 'Now',
+            previous: [{ evidenceText: 'Then', officialScore: 1 }]
+          }
+        }
+      })
+      const { result } = await server.inject({ url: '/people/legacy-history' })
+      expect(result.gdad.leading_design.previous).toEqual([
+        {
+          evidenceText: 'Then',
+          evidenceUpdatedAt: null,
+          evidenceUpdatedById: null,
+          officialScore: 1,
+          scoredAt: null,
+          scoredById: null,
+          archivedAt: null
+        }
+      ])
+    })
+
+    test('promotes a skill whose current evidence was cleared', async () => {
+      const person = await createPerson({ name: 'Cleared Current' })
+      const scorer = await createPerson({ name: 'Cleared Scorer' })
+      await saveEvidence(person, { designing_together: 'First' })
+      await score(person, { designing_together: 2 }, scorer.id)
+      await saveNewEvidence(person, { designing_together: 'Second' })
+      await saveEvidence(person, { designing_together: '' })
+
+      const result = await score(person, { designing_together: 3 }, scorer.id)
+      const entry = result.gdad.designing_together
+      expect(entry.evidenceText).toBe('Second')
+      expect(entry.officialScore).toBe(3)
+      expect(entry).toMatchObject(NEW_FIELDS_EMPTY)
+      expect(entry.previous).toHaveLength(1)
+      expect(entry.previous[0]).toMatchObject({
+        evidenceText: null,
+        evidenceUpdatedAt: null,
+        evidenceUpdatedById: null,
+        officialScore: 2,
+        scoredById: scorer.id
+      })
+    })
+
+    test('a skill with a score but no evidence', async () => {
+      const person = await createPerson({ name: 'Score Only' })
+      const scorer = await createPerson({ name: 'Score Only Scorer' })
+
+      const first = await score(person, { leading_design: 2 }, scorer.id)
+      expect(first.gdad.leading_design).toMatchObject({
+        evidenceText: null,
+        evidenceUpdatedAt: null,
+        officialScore: 2,
+        ...NEW_FIELDS_EMPTY,
+        previous: []
+      })
+
+      const refused = await saveNewEvidence(person, { leading_design: 'Next' })
+      expect(refused.statusCode).toBe(409)
+      expect(refused.result.code).toBe('no_current_evidence')
+
+      const rescored = await score(person, { leading_design: 3 }, scorer.id)
+      expect(rescored.gdad.leading_design.officialScore).toBe(3)
+      expect(rescored.gdad.leading_design.previous).toEqual([])
+    })
+
+    describe('when the record changes mid-save', () => {
+      const realUpdateOne = Collection.prototype.updateOne
+
+      afterEach(() => {
+        vi.restoreAllMocks()
+      })
+
+      // Runs `write` just before the next updateOne, i.e. after the scores
+      // route has read the record
+      function interceptNextUpdate(write) {
+        vi.spyOn(Collection.prototype, 'updateOne').mockImplementationOnce(
+          async function (...args) {
+            await write()
+            return realUpdateOne.apply(this, args)
+          }
+        )
+      }
+
+      test('retries and promotes when only the current evidence changed', async () => {
+        const person = await createPerson({ name: 'Retry Person' })
+        const scorer = await createPerson({ name: 'Retry Scorer' })
+        await saveEvidence(person, { leading_design: 'Current' })
+        await score(person, { leading_design: 1 }, scorer.id)
+        await saveNewEvidence(person, { leading_design: 'Next' })
+
+        interceptNextUpdate(() =>
+          realUpdateOne.call(
+            server.db.collection('people'),
+            { _id: new ObjectId(person.id) },
+            { $set: { 'gdad.leading_design.evidenceText': 'Current edited' } }
+          )
+        )
+        const result = await score(person, { leading_design: 2 }, scorer.id)
+        const entry = result.gdad.leading_design
+        expect(entry.evidenceText).toBe('Next')
+        expect(entry.officialScore).toBe(2)
+        expect(entry.previous).toHaveLength(1)
+        expect(entry.previous[0].evidenceText).toBe('Current edited')
+      })
+
+      test('refuses with concurrent_update when new evidence appears', async () => {
+        const person = await createPerson({ name: 'Race Person' })
+        const scorer = await createPerson({ name: 'Race Scorer' })
+        await saveEvidence(person, { leading_design: 'Current' })
+
+        interceptNextUpdate(() =>
+          realUpdateOne.call(
+            server.db.collection('people'),
+            { _id: new ObjectId(person.id) },
+            { $set: { 'gdad.leading_design.newEvidenceText': 'Unseen' } }
+          )
+        )
+        const response = await put(`/people/${person.id}/gdad/scores`, {
+          scores: { leading_design: 2 },
+          scoredById: scorer.id
+        })
+        expect(response.statusCode).toBe(409)
+        expect(response.result.code).toBe('concurrent_update')
+
+        const { result } = await server.inject({ url: `/people/${person.id}` })
+        const entry = result.gdad.leading_design
+        expect(entry.evidenceText).toBe('Current')
+        expect(entry.newEvidenceText).toBe('Unseen')
+        expect(entry.officialScore).toBeNull()
+        expect(entry.previous).toEqual([])
+      })
     })
 
     test('scores reject an unknown skill or person', async () => {

@@ -97,6 +97,7 @@ function apiGdadPrevious(entry) {
   return {
     evidenceText: entry.evidenceText ?? null,
     evidenceUpdatedAt: isoOrNull(entry.evidenceUpdatedAt),
+    evidenceUpdatedById: idOrNull(entry.evidenceUpdatedById),
     officialScore: entry.officialScore ?? null,
     scoredAt: isoOrNull(entry.scoredAt),
     scoredById: idOrNull(entry.scoredById),
@@ -526,7 +527,9 @@ const MAX_SCORE_ATTEMPTS = 3
  * evidence becomes current. Clearing a score (null) never promotes.
  *
  * The update is a single updateOne per person. It only applies if the
- * evidence it read is unchanged, and retries a few times if not.
+ * evidence it read is unchanged, and retries a few times if not. A retry
+ * refuses (concurrent_update) if a scored skill's new evidence differs from
+ * the first read, so the score never lands on evidence the reviewer didn't see.
  */
 export async function upsertGdadScores(
   db,
@@ -541,10 +544,27 @@ export async function upsertGdadScores(
     checkSkillKey(skillKey)
   }
 
+  const scoredSkills = Object.entries(scoresBySkill)
+    .filter(([, score]) => score !== null)
+    .map(([skillKey]) => skillKey)
+  const newEvidenceOf = (doc, skillKey) =>
+    doc.gdad?.[skillKey]?.newEvidenceText ?? null
+  let firstRead = null
+
   for (let attempt = 0; attempt < MAX_SCORE_ATTEMPTS; attempt++) {
     const doc = await people(db).findOne({ _id })
     if (!doc) {
       throw new PeopleError('not_found', idOrSlug)
+    }
+    if (!firstRead) {
+      firstRead = doc
+    } else if (
+      scoredSkills.some(
+        (skillKey) =>
+          newEvidenceOf(doc, skillKey) !== newEvidenceOf(firstRead, skillKey)
+      )
+    ) {
+      throw new PeopleError('concurrent_update', person.id)
     }
     const filter = { _id }
     const $set = {}
@@ -570,6 +590,7 @@ export async function upsertGdadScores(
               {
                 evidenceText: entry.evidenceText ?? null,
                 evidenceUpdatedAt: entry.evidenceUpdatedAt ?? null,
+                evidenceUpdatedById: entry.evidenceUpdatedById ?? null,
                 officialScore: entry.officialScore ?? null,
                 scoredAt: entry.scoredAt ?? null,
                 scoredById: entry.scoredById ?? null,
